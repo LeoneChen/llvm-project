@@ -203,6 +203,7 @@ extern "C" size_t LLVMFuzzerMutate(uint8_t *Data, size_t Size, size_t MaxSize) {
 }
 
 // Execute any files provided as parameters.
+__attribute__((no_sanitize_address))
 static int ExecuteFilesOnyByOne(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     std::ifstream in(argv[i], std::ios::binary);

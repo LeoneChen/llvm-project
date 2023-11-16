@@ -20,7 +20,8 @@
 #include <memory>
 #include <mutex>
 #include <set>
-
+#include <chrono>
+#include <ctime>
 #if defined(__has_include)
 #if __has_include(<sanitizer / lsan_interface.h>)
 #include <sanitizer/lsan_interface.h>
@@ -470,19 +471,23 @@ bool Fuzzer::RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile,
 
   ExecuteCallback(Data, Size);
 
+  auto TimeOfUnit = duration_cast<microseconds>(UnitStopTime - UnitStartTime);
+
   UniqFeatureSetTmp.clear();
   size_t FoundUniqFeaturesOfII = 0;
   size_t NumUpdatesBefore = Corpus.NumFeatureUpdates();
-  TPC.CollectFeatures([&](size_t Feature) {
+  Corpus.ClearTmpEdgeSet();
+  TPC.CollectFeatures([&](size_t Feature, bool EdgeFeature) {
     if (Corpus.AddFeature(Feature, Size, Options.Shrink))
       UniqFeatureSetTmp.push_back(Feature);
-    if (Options.Entropic)
+    if (Options.Kscheduler && EdgeFeature)
       Corpus.UpdateFeatureFrequency(II, Feature);
     if (Options.ReduceInputs && II)
       if (std::binary_search(II->UniqFeatureSet.begin(),
                              II->UniqFeatureSet.end(), Feature))
         FoundUniqFeaturesOfII++;
   });
+  
   if (FoundUniqFeatures)
     *FoundUniqFeatures = FoundUniqFeaturesOfII;
   PrintPulseAndReportSlowInput(Data, Size);
@@ -491,7 +496,7 @@ bool Fuzzer::RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile,
     TPC.UpdateObservedPCs();
     auto NewII = Corpus.AddToCorpus({Data, Data + Size}, NumNewFeatures,
                                     MayDeleteFile, TPC.ObservedFocusFunction(),
-                                    UniqFeatureSetTmp, DFT, II);
+                                    TimeOfUnit,UniqFeatureSetTmp, DFT, II);
     WriteFeatureSetToFile(Options.FeaturesDir, Sha1ToString(NewII->Sha1),
                           NewII->UniqFeatureSet);
     return true;
@@ -599,9 +604,9 @@ void Fuzzer::PrintStatusForNewUnit(const Unit &U, const char *Text) {
     return;
   PrintStats(Text, "");
   if (Options.Verbosity) {
-    Printf(" L: %zd/%zd ", U.size(), Corpus.MaxInputSize());
+    Printf(" avg_exec: %d L: %zd/%zd ", Corpus.AvgExecTime.count(), U.size(), Corpus.MaxInputSize());
     MD.PrintMutationSequence();
-    Printf("\n");
+    Printf("  elapsed time: %d\n", (int)(secondsSinceProcessStartUp()/60));
   }
 }
 
@@ -663,9 +668,9 @@ void Fuzzer::TryDetectingAMemoryLeak(const uint8_t *Data, size_t Size,
 void Fuzzer::MutateAndTestOne() {
   MD.StartMutationSequence();
 
-  auto &II = Corpus.ChooseUnitToMutate(MD.GetRand());
+  auto &II = Corpus.ChooseUnitToMutate(MD.GetRand(), secondsSinceProcessStartUp());
   if (Options.DoCrossOver)
-    MD.SetCrossOverWith(&Corpus.ChooseUnitToMutate(MD.GetRand()).U);
+    MD.SetCrossOverWith(&Corpus.ChooseUnitToMutate(MD.GetRand(), secondsSinceProcessStartUp()).U);
   const auto &U = II.U;
   memcpy(BaseSha1, II.Sha1, sizeof(BaseSha1));
   assert(CurrentUnitData);
@@ -678,7 +683,8 @@ void Fuzzer::MutateAndTestOne() {
   size_t CurrentMaxMutationLen =
       Min(MaxMutationLen, Max(U.size(), TmpMaxMutationLen));
   assert(CurrentMaxMutationLen > 0);
-
+  
+  //size_t old_ft = Corpus.NumFeatures();
   for (int i = 0; i < Options.MutateDepth; i++) {
     if (TotalNumberOfRuns >= Options.MaxNumberOfRuns)
       break;
@@ -710,8 +716,14 @@ void Fuzzer::MutateAndTestOne() {
     if (Options.ReduceDepth && !FoundUniqFeatures)
       break;
   }
+  II.FuzzedBefore = true; 
 
-  II.NeedsEnergyUpdate = true;
+  Corpus.DumpWeight(secondsSinceProcessStartUp());
+  Corpus.DumpWeight2(secondsSinceProcessStartUp(), TPC.GetTotalPCCoverage(), Corpus.NumFeatures());
+  
+  // Compute seed energy when the minimum number of mutations has been satisfied.
+  if (!II.ComputedBefore && (II.NumExecutedMutations > Corpus.MinNumMuTationsForEachSeed))
+    Corpus.SetDistributionNeedsUpdate();
 }
 
 void Fuzzer::PurgeAllocator() {

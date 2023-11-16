@@ -11,6 +11,10 @@
 #ifndef LLVM_FUZZER_CORPUS
 #define LLVM_FUZZER_CORPUS
 
+#include <iostream>
+#include <math.h>
+#include <string>
+#include <chrono>
 #include "FuzzerDataFlowTrace.h"
 #include "FuzzerDefs.h"
 #include "FuzzerIO.h"
@@ -21,10 +25,13 @@
 #include <numeric>
 #include <random>
 #include <unordered_set>
+#include <fstream>
 
 namespace fuzzer {
 
 struct InputInfo {
+  std::chrono::microseconds TimeOfUnit;
+  uint32_t PerfScore;
   Unit U;  // The actual input data.
   uint8_t Sha1[kSHA1NumBytes];  // Checksum.
   // Number of features that this input has and no smaller input has.
@@ -36,13 +43,18 @@ struct InputInfo {
   bool MayDeleteFile = false;
   bool Reduced = false;
   bool HasFocusFunction = false;
+  Vector <uint32_t> LocalFeatureSet;
   Vector<uint32_t> UniqFeatureSet;
   Vector<uint8_t> DataFlowTraceForFocusFunction;
   // Power schedule.
   bool NeedsEnergyUpdate = false;
+  bool ComputedBefore = false;
+  bool FuzzedBefore = false;
   double Energy = 0.0;
-  size_t SumIncidence = 0;
-  Vector<std::pair<uint32_t, uint16_t>> FeatureFreqs;
+  Vector<std::pair<uint32_t, uint32_t>> BorderEdgeSet;
+  Vector<int> BorderEdgeIdx;
+  Vector<std::pair<uint32_t, uint32_t>> FeatureFreqs;
+  Vector<std::pair<uint32_t, uint32_t>> FeatureFreqs2; // Debug only
 
   // Delete feature Idx and its frequency from FeatureFreqs.
   bool DeleteFeatureFreq(uint32_t Idx) {
@@ -51,7 +63,7 @@ struct InputInfo {
 
     // Binary search over local feature frequencies sorted by index.
     auto Lower = std::lower_bound(FeatureFreqs.begin(), FeatureFreqs.end(),
-                                  std::pair<uint32_t, uint16_t>(Idx, 0));
+                                  std::pair<uint32_t, uint32_t>(Idx, 0));
 
     if (Lower != FeatureFreqs.end() && Lower->first == Idx) {
       FeatureFreqs.erase(Lower);
@@ -60,82 +72,162 @@ struct InputInfo {
     return false;
   }
 
-  // Assign more energy to a high-entropy seed, i.e., that reveals more
-  // information about the globally rare features in the neighborhood
-  // of the seed. Since we do not know the entropy of a seed that has
-  // never been executed we assign fresh seeds maximum entropy and
-  // let II->Energy approach the true entropy from above.
-  void UpdateEnergy(size_t GlobalNumberOfFeatures) {
-    Energy = 0.0;
-    SumIncidence = 0;
+  // Insert border edges and its corresponding border edge idx into BorderEdgeSet and BorderEdgeIdx respectively .
+  void InsertEdgePair(uint32_t child, uint32_t parent, uint32_t Idx) {
 
-    // Apply add-one smoothing to locally discovered features.
-    for (auto F : FeatureFreqs) {
-      size_t LocalIncidence = F.second + 1;
-      Energy -= LocalIncidence * logl(LocalIncidence);
-      SumIncidence += LocalIncidence;
-    }
-
-    // Apply add-one smoothing to locally undiscovered features.
-    //   PreciseEnergy -= 0; // since logl(1.0) == 0)
-    SumIncidence += (GlobalNumberOfFeatures - FeatureFreqs.size());
-
-    // Add a single locally abundant feature apply add-one smoothing.
-    size_t AbdIncidence = NumExecutedMutations + 1;
-    Energy -= AbdIncidence * logl(AbdIncidence);
-    SumIncidence += AbdIncidence;
-
-    // Normalize.
-    if (SumIncidence != 0)
-      Energy = (Energy / SumIncidence) + logl(SumIncidence);
-  }
-
-  // Increment the frequency of the feature Idx.
-  void UpdateFeatureFrequency(uint32_t Idx) {
-    NeedsEnergyUpdate = true;
-
-    // The local feature frequencies is an ordered vector of pairs.
-    // If there are no local feature frequencies, push_back preserves order.
-    // Set the feature frequency for feature Idx32 to 1.
-    if (FeatureFreqs.empty()) {
-      FeatureFreqs.push_back(std::pair<uint32_t, uint16_t>(Idx, 1));
+    if (BorderEdgeSet.empty()) {
+      BorderEdgeSet.push_back(std::pair<uint32_t, uint32_t>(child, parent));
+      BorderEdgeIdx.push_back(Idx);
       return;
     }
 
-    // Binary search over local feature frequencies sorted by index.
-    auto Lower = std::lower_bound(FeatureFreqs.begin(), FeatureFreqs.end(),
-                                  std::pair<uint32_t, uint16_t>(Idx, 0));
+    // Binary search to find the location since the pair is sorted.
+    auto Lower = std::lower_bound(BorderEdgeSet.begin(), BorderEdgeSet.end(),
+                                  std::pair<uint32_t, uint32_t>(child, parent));
 
-    // If feature Idx32 already exists, increment its frequency.
-    // Otherwise, insert a new pair right after the next lower index.
-    if (Lower != FeatureFreqs.end() && Lower->first == Idx) {
-      Lower->second++;
-    } else {
-      FeatureFreqs.insert(Lower, std::pair<uint32_t, uint16_t>(Idx, 1));
-    }
+    int TmpIdx = Lower - BorderEdgeSet.begin();
+    BorderEdgeSet.insert(Lower, std::pair<uint32_t, uint32_t>(child, parent));
+    BorderEdgeIdx.insert(BorderEdgeIdx.begin()+TmpIdx, Idx);
   }
+
+  // Check if a border edge has been used to compute current seed's energy. If so, delete the border edge from current seed's energy compuation.
+  int SearchAndDeleteEdgePair(uint32_t child, uint32_t parent) {
+    // The border edge is not used to compute current seed's energy.
+    if (BorderEdgeSet.empty())
+      return -2;
+
+    // Binary search.
+    auto Lower = std::lower_bound(BorderEdgeSet.begin(), BorderEdgeSet.end(),
+                                  std::pair<uint32_t, uint32_t>(child, parent));
+
+    if (Lower != BorderEdgeSet.end() && Lower->first == child && Lower->second == parent) {
+      int TmpIdx = Lower - BorderEdgeSet.begin();
+      BorderEdgeSet.erase(Lower);
+
+      int ret_idx = BorderEdgeIdx[TmpIdx];
+      BorderEdgeIdx.erase(BorderEdgeIdx.begin()+TmpIdx);
+      
+      return ret_idx;
+    }
+    return -2;
+  }
+
+
+  // Debug-only 
+  void PrintFeatureFreq() {
+    Printf("{");
+    
+    for (auto F : FeatureFreqs2) 
+      Printf("%u: %u, ", F.first, F.second);
+    
+    Printf("}");
+  }
+
 };
 
-struct EntropicOptions {
+struct KschedulerOptions {
   bool Enabled;
   size_t NumberOfRarestFeatures;
   size_t FeatureFrequencyThreshold;
 };
 
 class InputCorpus {
-  static const uint32_t kFeatureSetSize = 1 << 21;
+  static const uint32_t kFeatureSetSize = 1 << 21; // maximum number of features
+  static const uint32_t kEdgeSize = 1 << 17;       // maximum number of edges
   static const uint8_t kMaxMutationFactor = 20;
   static const size_t kSparseEnergyUpdates = 100;
+  //static const size_t TopK = 4096;
 
   size_t NumExecutedMutations = 0;
 
-  EntropicOptions Entropic;
+  KschedulerOptions Kscheduler;
 
 public:
-  InputCorpus(const std::string &OutputCorpus, EntropicOptions Entropic)
-      : Entropic(Entropic), OutputCorpus(OutputCorpus) {
+  // Average execution time for all mutations generated by Libfuzzer.
+  std::chrono::microseconds AvgExecTime = std::chrono::microseconds(0); 
+  // Miniumum number of mutations for each seeds.
+  size_t MinNumMuTationsForEachSeed = 100;
+  InputCorpus(const std::string &OutputCorpus, KschedulerOptions Kscheduler, size_t MinNumMutation)
+      : Kscheduler(Kscheduler), OutputCorpus(OutputCorpus) {
     memset(InputSizesPerFeature, 0, sizeof(InputSizesPerFeature));
     memset(SmallestElementPerFeature, 0, sizeof(SmallestElementPerFeature));
+    
+    MinNumMuTationsForEachSeed = MinNumMutation;
+    // read centrality
+    std::ifstream infile("katz_cent");
+    int a;
+    double b;
+    int cnt = 0;
+    while (infile >> a >> b){
+        EdgeWeight[a] = b;
+        cnt += 1;
+    }
+    infile.close();
+    Printf("printf centrality\n");
+    for (int i =0; i < cnt; i++) {
+        std::cout << i << " " << EdgeWeight[i] << "\n";
+    }
+    
+    // read adjacency list 
+    std::ifstream infile1("child_node");
+
+    std::string line;
+    while (std::getline(infile1, line))
+    {
+        std::istringstream ss(line);
+        int node_id;
+        ss >> node_id;
+        int node;
+        while(ss >> node){
+            Child[node_id].push_back(node);
+        }
+    }
+    infile1.close();
+    cnt = 0;        
+    for (auto y: Child) {      
+      std::cout << cnt << " "; 
+      for (auto x: y)          
+        std::cout << x << " "; 
+      printf("\n");            
+      cnt+=1;                                                                       
+    }                 
+    
+    // read node2parent mapping
+    std::ifstream infile2("parent_node");
+
+    while (getline(infile2, line))
+    {
+        std::istringstream ss(line);
+        int node_id;
+        ss >> node_id;
+        int node;
+        while(ss >> node){
+            Parent[node_id].push_back(node);
+        }
+    }
+    infile2.close();                                                                                                         
+    cnt = 0;                                                                                                                 
+    for (auto y: Parent) {                                                                                                    
+        std::cout << cnt << " ";                                                                                             
+        for (auto x: y)                                                                                                      
+            std::cout << x << " ";                                                                                           
+        printf("\n");                                                                                                        
+        cnt+=1;                                                                                                                                                                               
+    }                 
+    
+    // read all border edges
+    std::ifstream infile3("border_edges");
+    cnt = 0;
+    uint32_t border_p, border_c;
+    while (infile3 >> border_p >> border_c){
+        BorderEdge.push_back(std::pair<uint32_t, uint32_t>(border_p, border_c));
+        cnt += 1;
+    }
+    infile3.close();
+    Printf("printf border edge pair\n");
+    for (int i =0; i < cnt; i++) {
+        std::cout << i << " " << BorderEdge[i].first <<  " " << BorderEdge[i].second<< "\n";
+    }
   }
   ~InputCorpus() {
     for (auto II : Inputs)
@@ -161,6 +253,7 @@ public:
     return Res;
   }
   void IncrementNumExecutedMutations() { NumExecutedMutations++; }
+  size_t GetNumExecutedMutations() { return NumExecutedMutations; }
 
   size_t NumInputsThatTouchFocusFunction() {
     return std::count_if(Inputs.begin(), Inputs.end(), [](const InputInfo *II) {
@@ -174,10 +267,25 @@ public:
     });
   }
 
+  // Insert edge idx into TmpEdgeSet
+  void InsertEdge2Tmp(uint32_t Idx) {
+
+    if (TmpEdgeSet.empty()) {
+      TmpEdgeSet.push_back(Idx);
+      return;
+    }
+
+    // Binary search..
+    auto Lower = std::lower_bound(TmpEdgeSet.begin(), TmpEdgeSet.end(), Idx);
+
+    TmpEdgeSet.insert(Lower, Idx);
+  }
+  
+
   bool empty() const { return Inputs.empty(); }
   const Unit &operator[] (size_t Idx) const { return Inputs[Idx]->U; }
   InputInfo *AddToCorpus(const Unit &U, size_t NumFeatures, bool MayDeleteFile,
-                         bool HasFocusFunction,
+                         bool HasFocusFunction, std::chrono::microseconds TimeOfUnit,
                          const Vector<uint32_t> &FeatureSet,
                          const DataFlowTrace &DFT, const InputInfo *BaseII) {
     assert(!U.empty());
@@ -186,13 +294,29 @@ public:
     Inputs.push_back(new InputInfo());
     InputInfo &II = *Inputs.back();
     II.U = U;
+    II.TimeOfUnit = TimeOfUnit;
+    
+     
+    if (TotalExecTime.count() == 0){
+      TotalExecTime += TimeOfUnit; 
+      AvgExecTime += TimeOfUnit;
+    }
+    else{
+      if (TimeOfUnit.count() <= AvgExecTime.count()*4){
+        TotalExecTime += TimeOfUnit;
+        AvgExecTime = TotalExecTime/(Inputs.size() - NumOfSlowInputs);
+      }
+      else
+        NumOfSlowInputs += 1;
+    }
+    
+    II.LocalFeatureSet = TmpEdgeSet; 
     II.NumFeatures = NumFeatures;
     II.MayDeleteFile = MayDeleteFile;
     II.UniqFeatureSet = FeatureSet;
     II.HasFocusFunction = HasFocusFunction;
     // Assign maximal energy to the new seed.
-    II.Energy = RareFeatures.empty() ? 1.0 : log(RareFeatures.size());
-    II.SumIncidence = RareFeatures.size();
+    II.Energy = 100000.0;
     II.NeedsEnergyUpdate = false;
     std::sort(II.UniqFeatureSet.begin(), II.UniqFeatureSet.end());
     ComputeSHA1(U.data(), U.size(), II.Sha1);
@@ -206,7 +330,8 @@ public:
     // But if we don't, we'll use the DFT of its base input.
     if (II.DataFlowTraceForFocusFunction.empty() && BaseII)
       II.DataFlowTraceForFocusFunction = BaseII->DataFlowTraceForFocusFunction;
-    DistributionNeedsUpdate = true;
+    
+    
     PrintCorpus();
     // ValidateFeatureSet();
     return &II;
@@ -231,6 +356,7 @@ public:
     Printf("}");
   }
 
+  
   // Debug-only
   void PrintCorpus() {
     if (!FeatureDebug) return;
@@ -262,15 +388,15 @@ public:
 
   bool HasUnit(const Unit &U) { return Hashes.count(Hash(U)); }
   bool HasUnit(const std::string &H) { return Hashes.count(H); }
-  InputInfo &ChooseUnitToMutate(Random &Rand) {
-    InputInfo &II = *Inputs[ChooseUnitIdxToMutate(Rand)];
+  InputInfo &ChooseUnitToMutate(Random &Rand, int CurTime) {
+    InputInfo &II = *Inputs[ChooseUnitIdxToMutate(Rand, CurTime)];
     assert(!II.U.empty());
     return II;
   }
 
   // Returns an index of random unit from the corpus to mutate.
-  size_t ChooseUnitIdxToMutate(Random &Rand) {
-    UpdateCorpusDistribution(Rand);
+  size_t ChooseUnitIdxToMutate(Random &Rand, int CurTime ) {
+    UpdateCorpusDistribution(Rand, CurTime);
     size_t Idx = static_cast<size_t>(CorpusDistribution(Rand));
     assert(Idx < Inputs.size());
     return Idx;
@@ -297,6 +423,31 @@ public:
     Printf("\n");
   }
 
+  void PrintFeatureSet2() {
+    for (size_t i = 0; i < kFeatureSetSize; i++) {
+      if(uint16_t freq = GlobalFeatureFreqs[i])
+        Printf("[%zd: %zd ] ", i, freq);
+    }
+    Printf("\n\t");
+  }
+  
+  // Delete feature Idx and its frequency from FeatureFreqs.
+  int SearchBorderEdgeIdx(uint32_t child, uint32_t parent) {
+
+    if (BorderEdge.empty())
+      return -1;
+
+    // Binary search over local feature frequencies sorted by index.
+    auto Lower = std::lower_bound(BorderEdge.begin(), BorderEdge.end(),
+                                  std::pair<uint32_t, uint32_t>(parent, child));
+
+    if (Lower != BorderEdge.end() && Lower->first == parent && Lower->second == child)
+      return Lower-BorderEdge.begin();
+    
+    
+    return -1;
+  }
+  
   void DeleteFile(const InputInfo &II) {
     if (!OutputCorpus.empty() && II.MayDeleteFile)
       RemoveFile(DirPlusFile(OutputCorpus, Sha1ToString(II.Sha1)));
@@ -312,58 +463,69 @@ public:
     if (FeatureDebug)
       Printf("EVICTED %zd\n", Idx);
   }
+  
 
-  void AddRareFeature(uint32_t Idx) {
-    // Maintain *at least* TopXRarestFeatures many rare features
-    // and all features with a frequency below ConsideredRare.
-    // Remove all other features.
-    while (RareFeatures.size() > Entropic.NumberOfRarestFeatures &&
-           FreqOfMostAbundantRareFeature > Entropic.FeatureFrequencyThreshold) {
-
-      // Find most and second most abbundant feature.
-      uint32_t MostAbundantRareFeatureIndices[2] = {RareFeatures[0],
-                                                    RareFeatures[0]};
-      size_t Delete = 0;
-      for (size_t i = 0; i < RareFeatures.size(); i++) {
-        uint32_t Idx2 = RareFeatures[i];
-        if (GlobalFeatureFreqs[Idx2] >=
-            GlobalFeatureFreqs[MostAbundantRareFeatureIndices[0]]) {
-          MostAbundantRareFeatureIndices[1] = MostAbundantRareFeatureIndices[0];
-          MostAbundantRareFeatureIndices[0] = Idx2;
-          Delete = i;
+  // Compute energy for a seed based on its Katz Centraltiy and its runtime cost. 
+  void ComputeEnergy(InputInfo *II, std::chrono::microseconds AverageUnitExecutionTime) {
+    II->Energy = 0.0;
+    // Identify border edges for a seed when we encounter it for the first time, then save the border edges into BorderEdgeSet.
+    if (II->BorderEdgeSet.size() == 0){
+      // Loop every border edges of a seed.
+      for (auto Idx: II->LocalFeatureSet){
+        // Get child node for each visited node of a seed
+        for (auto child: Child[Idx]){
+          // If child node is not visited, then we find a border edges.
+          if (GlobalFeatureFreqs[child] == 0){ 
+            double TmpEdgeWeight = 0.0;
+            // case 1: EdgeWeight == 0
+            if (EdgeWeight[child] == 0.0)
+              TmpEdgeWeight = 0.0;
+            else{
+              int BorderEdgeIdx = SearchBorderEdgeIdx(child, Idx);
+              if (BorderEdgeIdx != -1){
+                // case 2: EdgeWeight != 0 and found in borderEdge weight table
+                TmpEdgeWeight = BorderEdgeWeight[BorderEdgeIdx];
+                // case 3: EdgeWeight == 0 and not found in borderEdge weight table, compute EdgeWeight and cache it in the borderEdge weight table.
+                if (TmpEdgeWeight == 0.0){
+                  TmpEdgeWeight =  EdgeWeight[child] / sqrt(GlobalFeatureFreqs[Idx]);
+                  BorderEdgeWeight[BorderEdgeIdx] = TmpEdgeWeight;
+                }
+              }
+              // save border edges into BorderEdgeSet
+              II->InsertEdgePair(child, Idx, BorderEdgeIdx);
+            }
+            // Compute Katz centrality
+            II->Energy += TmpEdgeWeight;
+          }
         }
       }
-
-      // Remove most abundant rare feature.
-      RareFeatures[Delete] = RareFeatures.back();
-      RareFeatures.pop_back();
-
-      for (auto II : Inputs) {
-        if (II->DeleteFeatureFreq(MostAbundantRareFeatureIndices[0]))
-          II->NeedsEnergyUpdate = true;
-      }
-
-      // Set 2nd most abundant as the new most abundant feature count.
-      FreqOfMostAbundantRareFeature =
-          GlobalFeatureFreqs[MostAbundantRareFeatureIndices[1]];
+      
+      // Some super slow seeds would have large Katz centraltiy score, we penalize them by performance score. 
+      // NOTE: we only penalize seeds with extremely large runtime overhead, but never boost seeds with smaller runtime overhead. Because seeds with smaller runtime overhead are not necessarliy good/promisng seeds. A promising seed should have a large Katz centrality and a NOT-large runtime overhead.
+      uint32_t CurPerfScore = 100;
+      if (II->TimeOfUnit.count() > AverageUnitExecutionTime.count() * 10)
+        CurPerfScore = 10;
+      else if (II->TimeOfUnit.count() > AverageUnitExecutionTime.count() * 4)
+        CurPerfScore = 25;
+      else if (II->TimeOfUnit.count() > AverageUnitExecutionTime.count() * 2)
+        CurPerfScore = 50;
+      else if (II->TimeOfUnit.count() * 3 > AverageUnitExecutionTime.count() * 4)
+        CurPerfScore = 75; 
+      II->PerfScore = CurPerfScore; 
+      II->Energy *= CurPerfScore;
     }
-
-    // Add rare feature, handle collisions, and update energy.
-    RareFeatures.push_back(Idx);
-    GlobalFeatureFreqs[Idx] = 0;
-    for (auto II : Inputs) {
-      II->DeleteFeatureFreq(Idx);
-
-      // Apply add-one smoothing to this locally undiscovered feature.
-      // Zero energy seeds will never be fuzzed and remain zero energy.
-      if (II->Energy > 0.0) {
-        II->SumIncidence += 1;
-        II->Energy += logl(II->SumIncidence) / II->SumIncidence;
+    // We have identified the border edges for this seed before and read directly from cached BorderEdgeIdx
+    else{
+      for (auto TmpIdx: II->BorderEdgeIdx){
+        double TmpEdgeWeight = 0.0;
+        if (TmpIdx != -1)
+          TmpEdgeWeight = BorderEdgeWeight[TmpIdx]; 
+        II->Energy += TmpEdgeWeight; 
       }
+      II->Energy *= II->PerfScore;
     }
-
-    DistributionNeedsUpdate = true;
   }
+
 
   bool AddFeature(size_t Idx, uint32_t NewSize, bool Shrink) {
     assert(NewSize);
@@ -379,8 +541,6 @@ public:
           DeleteInput(OldIdx);
       } else {
         NumAddedFeatures++;
-        if (Entropic.Enabled)
-          AddRareFeature((uint32_t)Idx);
       }
       NumUpdatedFeatures++;
       if (FeatureDebug)
@@ -391,34 +551,114 @@ public:
     }
     return false;
   }
-
-  // Increment frequency of feature Idx globally and locally.
-  void UpdateFeatureFrequency(InputInfo *II, size_t Idx) {
-    uint32_t Idx32 = Idx % kFeatureSetSize;
-
-    // Saturated increment.
-    if (GlobalFeatureFreqs[Idx32] == 0xFFFF)
-      return;
-    uint16_t Freq = GlobalFeatureFreqs[Idx32]++;
-
-    // Skip if abundant.
-    if (Freq > FreqOfMostAbundantRareFeature ||
-        std::find(RareFeatures.begin(), RareFeatures.end(), Idx32) ==
-            RareFeatures.end())
+ 
+  void DumpWeight2(int CurTime, size_t Cov, size_t FeatureCov){
+    int ElapsedTime = CurTime - LastLogTime;
+    if(ElapsedTime < 300)
       return;
 
-    // Update global frequencies.
-    if (Freq == FreqOfMostAbundantRareFeature)
-      FreqOfMostAbundantRareFeature++;
+    std::ofstream myfile;
+    myfile.open ("cov_stats", std::ofstream::out | std::ofstream::app);
+    myfile << "time: " << CurTime/60 << "cov: " << Cov << " feat: " << FeatureCov << "\n";
 
-    // Update local frequencies.
-    if (II)
-      II->UpdateFeatureFrequency(Idx32);
+    myfile.close();
+    LastLogTime = CurTime;
   }
 
+  void DumpWeight(int CurTime){
+  
+    int ElapsedTime = CurTime - LastDumpTime;
+    if(ElapsedTime < 120)
+      return;
+
+    DumpCov();
+    ReloadWeight();
+    std::ofstream myfile;
+    myfile.open ("weight_dump");
+    int Idx = 0; 
+    for (auto E: BorderEdge){
+      uint32_t parent = E.first;
+      uint32_t child = E.second;
+      
+      if (EdgeWeight[child] != 0.0 && GlobalFeatureFreqs[parent] && !GlobalFeatureFreqs[child]){
+        myfile << BorderEdgeWeight[Idx] << " " << EdgeWeight[child] << " " << 1/sqrt(GlobalFeatureFreqs[parent]) << " " << GlobalFeatureFreqs[parent]  << "\n";
+      }
+      Idx += 1;
+    }
+
+    myfile << "$$$$$$$$$$$$$$$$$$$\n";
+    for (auto II : Inputs)
+      myfile << II->Energy << " " << II->BorderEdgeIdx.size() << " "  << II->Energy/II->PerfScore  << " " << II->NumExecutedMutations << "\n";
+    
+    myfile.close(); 
+    LastDumpTime = CurTime;
+  }
+  
+  void DumpCov(){
+    std::ofstream myfile;
+    myfile.open ("cur_coverage");
+    
+    for (size_t i =0; i < kEdgeSize; i++){
+      if(GlobalFeatureFreqs[i] > 0)
+        myfile << i << " ";
+    }
+
+    myfile.close(); 
+    std::ofstream myfile1;
+    myfile1.open ("signal");
+    myfile1<<"1\n";
+    myfile1.close();
+  }
+  
+  void ReloadWeight(){
+    std::ifstream myfile;
+    myfile.open ("dyn_katz_cent");
+    
+    if(myfile.good() == false) return;
+    
+    int a;
+    double b;
+    int cnt = 0;
+    while (myfile >> a >> b){
+        EdgeWeight[a] = b;
+        std::cout << b << " " << EdgeWeight[a] << "\n";
+        cnt += 1;
+    }
+    myfile.close(); 
+  }
+  
+  void UpdateFeatureFrequency(InputInfo *II, size_t Idx) {
+    // Convert featuer idx to edge idx
+    uint32_t Idx32 = (Idx/8) % kFeatureSetSize;
+    uint32_t freq = GlobalFeatureFreqs[Idx32];
+   
+    // Hit a new edge, check if the new edge is a border edge associated with other seeds. If so, update other seeds' energy.
+    if(freq == 0)
+      for (auto parent: Parent[Idx32])
+        if (GlobalFeatureFreqs[parent])
+          for (auto tmp_II : Inputs) 
+            if (tmp_II->Energy != 0.0 && tmp_II->ComputedBefore){
+              int TmpIdx = tmp_II->SearchAndDeleteEdgePair(Idx32, parent);
+              // Current borderedge is used by this seed's energy computation.
+              if (TmpIdx != -2){
+                // Delete current border edge's weight from this seed's energy.
+                if (TmpIdx != -1)
+                  tmp_II->Energy -= (BorderEdgeWeight[TmpIdx] * tmp_II->PerfScore);
+              }
+            }
+
+    // Increment global edge hit count. 
+    GlobalFeatureFreqs[Idx32]++;
+    
+    InsertEdge2Tmp(Idx32);
+  }
+  
+  void SetDistributionNeedsUpdate(){
+    DistributionNeedsUpdate = true;
+  }
   size_t NumFeatures() const { return NumAddedFeatures; }
   size_t NumFeatureUpdates() const { return NumUpdatedFeatures; }
-
+  void ClearTmpEdgeSet() { TmpEdgeSet.clear(); }
 private:
 
   static const bool FeatureDebug = false;
@@ -439,17 +679,31 @@ private:
     }
   }
 
+  // Weight computation for each border edges. We pre-compute all border edges weight and cache the result in a table to avoid duplicated computation.
+  void ComputeMathCache(){
+  
+    int Idx = 0;
+    for (auto E: BorderEdge){
+      uint32_t parent = E.first;
+      uint32_t child = E.second;
+      
+      if (EdgeWeight[child] != 0.0 && GlobalFeatureFreqs[parent] && !GlobalFeatureFreqs[child]){
+        // weight = Katz_score_child / sqrt(hit_count_parent)
+        BorderEdgeWeight[Idx] =  EdgeWeight[child] / sqrt(GlobalFeatureFreqs[parent]); 
+      }
+      Idx += 1;
+    }
+    
+  }
+  
+
   // Updates the probability distribution for the units in the corpus.
-  // Must be called whenever the corpus or unit weights are changed.
-  //
-  // Hypothesis: inputs that maximize information about globally rare features
-  // are interesting.
-  void UpdateCorpusDistribution(Random &Rand) {
-    // Skip update if no seeds or rare features were added/deleted.
-    // Sparse updates for local change of feature frequencies,
-    // i.e., randomly do not skip.
-    if (!DistributionNeedsUpdate &&
-        (!Entropic.Enabled || Rand(kSparseEnergyUpdates)))
+  void UpdateCorpusDistribution(Random &Rand, int CurTime) {
+
+    if (! Kscheduler.Enabled)
+        return;
+    // Update corpus's energy every 2 minutes or new seeds whose minimum mutations have been satisfied.
+    if( (!DistributionNeedsUpdate) && (CurTime - LastComputeTime < 120))
       return;
 
     DistributionNeedsUpdate = false;
@@ -459,16 +713,40 @@ private:
     Intervals.resize(N + 1);
     Weights.resize(N);
     std::iota(Intervals.begin(), Intervals.end(), 0);
-
+    
+    std::chrono::microseconds AverageUnitExecutionTime(0);
+    AverageUnitExecutionTime = AvgExecTime;
+    
     bool VanillaSchedule = true;
-    if (Entropic.Enabled) {
-      for (auto II : Inputs) {
-        if (II->NeedsEnergyUpdate && II->Energy != 0.0) {
-          II->NeedsEnergyUpdate = false;
-          II->UpdateEnergy(RareFeatures.size());
+    
+    if (Kscheduler.Enabled){
+      // Compute energy for all seeds every 2 minutes.
+      if (CurTime - LastComputeTime > 120) {
+
+        // Compute border edge weight cache.
+        ComputeMathCache();
+        for (auto II : Inputs) {
+          // Compute energy when the minimum mutation on a seed has been satifsfied.
+          if (II->FuzzedBefore && (II->Energy != 0.0) && (II->NumExecutedMutations > MinNumMuTationsForEachSeed)) {
+            ComputeEnergy(II, AverageUnitExecutionTime);
+            II->ComputedBefore = true;
+          }
         }
+        LastComputeTime = CurTime;
       }
 
+      // Compute energy only for new seeds whose minmimum mutations have been satisfied.
+      else{
+        for (auto II : Inputs) {
+          if (!II->ComputedBefore &&  (II->Energy != 0.0) && (II->NumExecutedMutations > MinNumMuTationsForEachSeed)) {
+            ComputeEnergy(II, AverageUnitExecutionTime);
+            II->ComputedBefore = true;
+          }
+        }
+        
+      }
+      
+      WeightIntervalPair.resize(N);
       for (size_t i = 0; i < N; i++) {
 
         if (Inputs[i]->NumFeatures == 0) {
@@ -486,6 +764,9 @@ private:
         // If energy for all seeds is zero, fall back to vanilla schedule.
         if (Weights[i] > 0.0)
           VanillaSchedule = false;
+        WeightIntervalPair[i].first = Weights[i];
+        WeightIntervalPair[i].second = i;
+
       }
     }
 
@@ -504,27 +785,57 @@ private:
         Printf("%f ", Weights[i]);
       Printf("Weights\n");
     }
+    
+    /*
+    std::sort(WeightIntervalPair.rbegin(), WeightIntervalPair.rend());
+    size_t CurTopK = std::min(TopK, N);
+    TopKWeights.resize(CurTopK);
+    for (int i=0; i<CurTopK; i++){
+      TopKWeights[i] = WeightIntervalPair[i].first;
+      TopKIdx[i] = WeightIntervalPair[i].second; 
+    }
+
+    CorpusDistribution = std::discrete_distribution<int>(TopKWeights.begin(), TopKWeights.end());
+    */
     CorpusDistribution = std::piecewise_constant_distribution<double>(
         Intervals.begin(), Intervals.end(), Weights.begin());
+
   }
+  
   std::piecewise_constant_distribution<double> CorpusDistribution;
+  //std::discrete_distribution<int> CorpusDistribution;
 
   Vector<double> Intervals;
   Vector<double> Weights;
+  
+  Vector<std::pair<double, uint32_t>> WeightIntervalPair;
+  //Vector<double> TopKWeights;
+  //uint16_t TopKIdx[TopK] = {0};
 
   std::unordered_set<std::string> Hashes;
   Vector<InputInfo*> Inputs;
 
+  //std::chrono::microseconds AvgExecTime = std::chrono::microseconds(0); 
+  std::chrono::microseconds TotalExecTime = std::chrono::microseconds(0); 
+  
+  int LastComputeTime=0;
+  int LastLogTime=0;
+  int LastDumpTime=0;
+  uint32_t NumOfSlowInputs = 0;
   size_t NumAddedFeatures = 0;
   size_t NumUpdatedFeatures = 0;
   uint32_t InputSizesPerFeature[kFeatureSetSize];
   uint32_t SmallestElementPerFeature[kFeatureSetSize];
+  
+  double EdgeWeight[kEdgeSize] = {0.0};
+  double BorderEdgeWeight[kEdgeSize] = {0.0};
+  Vector<uint32_t> Child[kEdgeSize];
+  Vector<uint32_t> Parent[kEdgeSize];
+  Vector<std::pair<uint32_t, uint32_t>> BorderEdge;
 
   bool DistributionNeedsUpdate = true;
-  uint16_t FreqOfMostAbundantRareFeature = 0;
-  uint16_t GlobalFeatureFreqs[kFeatureSetSize] = {};
-  Vector<uint32_t> RareFeatures;
-
+  uint32_t GlobalFeatureFreqs[kEdgeSize] = {}; // Hit count of global edge coverage, maximum size equals kEdgeSize
+  Vector <uint32_t> TmpEdgeSet; // Unique edge coverage set for each seed.
   std::string OutputCorpus;
 };
 

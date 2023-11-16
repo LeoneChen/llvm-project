@@ -10,7 +10,7 @@
 
 #ifndef LLVM_FUZZER_TRACE_PC
 #define LLVM_FUZZER_TRACE_PC
-
+#include <iostream>
 #include "FuzzerDefs.h"
 #include "FuzzerDictionary.h"
 #include "FuzzerValueBitMap.h"
@@ -238,10 +238,12 @@ ATTRIBUTE_NOINLINE
 void TracePC::CollectFeatures(Callback HandleFeature) const {
   auto Handle8bitCounter = [&](size_t FirstFeature,
                                size_t Idx, uint8_t Counter) {
-    if (UseCounters)
-      HandleFeature(FirstFeature + Idx * 8 + CounterToFeature(Counter));
+    if (UseCounters){
+      size_t feat = FirstFeature + Idx * 8 + CounterToFeature(Counter);
+      HandleFeature(feat, true);
+    }
     else
-      HandleFeature(FirstFeature + Idx);
+      HandleFeature(FirstFeature + Idx, true);
   };
 
   size_t FirstFeature = 0;
@@ -258,10 +260,11 @@ void TracePC::CollectFeatures(Callback HandleFeature) const {
   FirstFeature +=
       8 * ForEachNonZeroByte(ExtraCountersBegin(), ExtraCountersEnd(),
                              FirstFeature, Handle8bitCounter);
-
+  
+  
   if (UseValueProfileMask) {
     ValueProfileMap.ForEach([&](size_t Idx) {
-      HandleFeature(FirstFeature + Idx);
+      HandleFeature(FirstFeature + Idx, false);
     });
     FirstFeature += ValueProfileMap.SizeInBits();
   }
@@ -279,7 +282,8 @@ void TracePC::CollectFeatures(Callback HandleFeature) const {
   assert(StackDepthStepFunction(1024 * 1024) == 144);
 
   if (auto MaxStackOffset = GetMaxStackOffset())
-    HandleFeature(FirstFeature + StackDepthStepFunction(MaxStackOffset / 8));
+    HandleFeature(FirstFeature + StackDepthStepFunction(MaxStackOffset / 8), false);
+  
 }
 
 extern TracePC TPC;

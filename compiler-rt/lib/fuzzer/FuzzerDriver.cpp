@@ -515,7 +515,7 @@ int AnalyzeDictionary(Fuzzer *F, const Vector<Unit>& Dict,
     // Get coverage for the testcase without modifications.
     F->ExecuteCallback(C.data(), C.size());
     InitialFeatures.clear();
-    TPC.CollectFeatures([&](size_t Feature) {
+    TPC.CollectFeatures([&](size_t Feature, bool EdgeCount) {
       InitialFeatures.push_back(Feature);
     });
 
@@ -538,10 +538,10 @@ int AnalyzeDictionary(Fuzzer *F, const Vector<Unit>& Dict,
                                Dict[i].begin(), Dict[i].end());
       }
 
-      // Get coverage for testcase with masked occurrences of dictionary unit.
+      // Get coverage for testcase with masked occurrences of dictionary unit.//
       F->ExecuteCallback(Data.data(), Data.size());
       ModifiedFeatures.clear();
-      TPC.CollectFeatures([&](size_t Feature) {
+      TPC.CollectFeatures([&](size_t Feature, bool EdgeCount) {
         ModifiedFeatures.push_back(Feature);
       });
 
@@ -709,26 +709,27 @@ int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
     Options.CollectDataFlow = Flags.collect_data_flow;
   if (Flags.stop_file)
     Options.StopFile = Flags.stop_file;
-  Options.Entropic = Flags.entropic;
-  Options.EntropicFeatureFrequencyThreshold =
-      (size_t)Flags.entropic_feature_frequency_threshold;
-  Options.EntropicNumberOfRarestFeatures =
-      (size_t)Flags.entropic_number_of_rarest_features;
-  if (Options.Entropic) {
+  Options.MinNumMuTationsForEachSeed = Flags.min_num_mutations_for_each_seed;
+  Options.Kscheduler = Flags.kscheduler;
+  Options.KschedulerFeatureFrequencyThreshold =
+      (size_t)Flags.kscheduler_feature_frequency_threshold;
+  Options.KschedulerNumberOfRarestFeatures =
+      (size_t)Flags.kscheduler_number_of_rarest_features;
+  if (Options.Kscheduler) {
     if (!Options.FocusFunction.empty()) {
-      Printf("ERROR: The parameters `--entropic` and `--focus_function` cannot "
+      Printf("ERROR: The parameters `--kscheduler` and `--focus_function` cannot "
              "be used together.\n");
       exit(1);
     }
-    Printf("INFO: Running with entropic power schedule (0x%X, %d).\n",
-           Options.EntropicFeatureFrequencyThreshold,
-           Options.EntropicNumberOfRarestFeatures);
+    Printf("INFO: Running with kscheduler power schedule (0x%X, %d).\n",
+           Options.KschedulerFeatureFrequencyThreshold,
+           Options.KschedulerNumberOfRarestFeatures);
   }
-  struct EntropicOptions Entropic;
-  Entropic.Enabled = Options.Entropic;
-  Entropic.FeatureFrequencyThreshold =
-      Options.EntropicFeatureFrequencyThreshold;
-  Entropic.NumberOfRarestFeatures = Options.EntropicNumberOfRarestFeatures;
+  struct KschedulerOptions Kscheduler;
+  Kscheduler.Enabled = Options.Kscheduler;
+  Kscheduler.FeatureFrequencyThreshold =
+      Options.KschedulerFeatureFrequencyThreshold;
+  Kscheduler.NumberOfRarestFeatures = Options.KschedulerNumberOfRarestFeatures;
 
   unsigned Seed = Flags.seed;
   // Initialize Seed.
@@ -749,7 +750,7 @@ int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
 
   Random Rand(Seed);
   auto *MD = new MutationDispatcher(Rand, Options);
-  auto *Corpus = new InputCorpus(Options.OutputCorpus, Entropic);
+  auto *Corpus = new InputCorpus(Options.OutputCorpus, Kscheduler, Options.MinNumMuTationsForEachSeed);
   auto *F = new Fuzzer(Callback, *Corpus, *MD, Options);
 
   for (auto &U: Dictionary)

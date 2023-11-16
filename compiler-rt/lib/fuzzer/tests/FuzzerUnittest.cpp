@@ -592,8 +592,8 @@ TEST(FuzzerUtil, Base64) {
 TEST(Corpus, Distribution) {
   DataFlowTrace DFT;
   Random Rand(0);
-  struct EntropicOptions Entropic = {false, 0xFF, 100};
-  std::unique_ptr<InputCorpus> C(new InputCorpus("", Entropic));
+  struct KschedulerOptions Kscheduler = {false, 0xFF, 100};
+  std::unique_ptr<InputCorpus> C(new InputCorpus("", Kscheduler));
   size_t N = 10;
   size_t TriesPerUnit = 1<<16;
   for (size_t i = 0; i < N; i++)
@@ -1051,13 +1051,13 @@ TEST(FuzzerCommand, SetOutput) {
   EXPECT_EQ(CmdLine, makeCmdLine("", ">thud 2>&1"));
 }
 
-TEST(Entropic, UpdateFrequency) {
+TEST(Kscheduler, UpdateFrequency) {
   const size_t One = 1, Two = 2;
   const size_t FeatIdx1 = 0, FeatIdx2 = 42, FeatIdx3 = 12, FeatIdx4 = 26;
   size_t Index;
-  // Create input corpus with default entropic configuration
-  struct EntropicOptions Entropic = {true, 0xFF, 100};
-  std::unique_ptr<InputCorpus> C(new InputCorpus("", Entropic));
+  // Create input corpus with default kscheduler configuration
+  struct KschedulerOptions Kscheduler = {true, 0xFF, 100};
+  std::unique_ptr<InputCorpus> C(new InputCorpus("", Kscheduler));
   std::unique_ptr<InputInfo> II(new InputInfo());
 
   C->AddRareFeature(FeatIdx1);
@@ -1091,10 +1091,10 @@ double SubAndSquare(double X, double Y) {
   return R;
 }
 
-TEST(Entropic, ComputeEnergy) {
+TEST(Kscheduler, ComputeEnergy) {
   const double Precision = 0.01;
-  struct EntropicOptions Entropic = {true, 0xFF, 100};
-  std::unique_ptr<InputCorpus> C(new InputCorpus("", Entropic));
+  struct KschedulerOptions Kscheduler = {true, 0xFF, 100};
+  std::unique_ptr<InputCorpus> C(new InputCorpus("", Kscheduler));
   std::unique_ptr<InputInfo> II(new InputInfo());
   Vector<std::pair<uint32_t, uint16_t>> FeatureFreqs = {{1, 3}, {2, 3}, {3, 3}};
   II->FeatureFreqs = FeatureFreqs;

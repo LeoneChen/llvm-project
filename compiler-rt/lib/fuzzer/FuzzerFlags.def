@@ -153,12 +153,13 @@ FUZZER_FLAG_STRING(focus_function, "Experimental. "
      "Fuzzing will focus on inputs that trigger calls to this function. "
      "If -focus_function=auto and -data_flow_trace is used, libFuzzer "
      "will choose the focus functions automatically.")
-FUZZER_FLAG_INT(entropic, 0, "Experimental. Enables entropic power schedule.")
-FUZZER_FLAG_INT(entropic_feature_frequency_threshold, 0xFF, "Experimental. If "
-     "entropic is enabled, all features which are observed less often than "
+FUZZER_FLAG_INT(min_num_mutations_for_each_seed, 100, "Experimental. Minimum mutations for each seed.")
+FUZZER_FLAG_INT(kscheduler, 0, "Experimental. Enables kscheduler power schedule.")
+FUZZER_FLAG_INT(kscheduler_feature_frequency_threshold, 0xFF, "Depracted(DO NOT USE). If "
+     "kscheduler is enabled, all features which are observed less often than "
      "the specified value are considered as rare.")
-FUZZER_FLAG_INT(entropic_number_of_rarest_features, 100, "Experimental. If "
-     "entropic is enabled, we keep track of the frequencies only for the "
+FUZZER_FLAG_INT(kscheduler_number_of_rarest_features, 100, "Depracted(DO NOT USE). If "
+     "kscheduler is enabled, we keep track of the frequencies only for the "
      "Top-X least abundant features (union features that are considered as "
      "rare).")
 
