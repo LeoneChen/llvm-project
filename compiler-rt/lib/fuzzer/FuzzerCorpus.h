@@ -123,6 +123,9 @@ struct EntropicOptions {
 };
 
 class InputCorpus {
+
+protected:
+
   static const uint32_t kFeatureSetSize = 1 << 21;
   static const uint8_t kMaxMutationFactor = 20;
   static const size_t kSparseEnergyUpdates = 100;
@@ -418,8 +421,9 @@ public:
 
   size_t NumFeatures() const { return NumAddedFeatures; }
   size_t NumFeatureUpdates() const { return NumUpdatedFeatures; }
+  inline std::string GetOutputCorpus () { return OutputCorpus; }
 
-private:
+protected:
 
   static const bool FeatureDebug = false;
 

@@ -61,6 +61,12 @@ using Set = std::set<T, std::less<T>, fuzzer_allocator<T>>;
 typedef Vector<uint8_t> Unit;
 typedef Vector<Unit> UnitVector;
 typedef int (*UserCallback)(const uint8_t *Data, size_t Size);
+typedef int (*UserCallbackCore)(const char *Script);
+typedef const char* (*GetRandomSeed) (const char *Dir);
+typedef const char* (*GetSpecifiedSeed) (const char *Seed);
+typedef std::size_t (*UserMutator)(uint8_t* data, std::size_t size, std::size_t max_size, unsigned int seed);
+
+
 
 int FuzzerDriver(int *argc, char ***argv, UserCallback Callback);
 

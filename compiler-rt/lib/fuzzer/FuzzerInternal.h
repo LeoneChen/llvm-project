@@ -32,23 +32,53 @@ using namespace std::chrono;
 class Fuzzer {
 public:
 
-  Fuzzer(UserCallback CB, InputCorpus &Corpus, MutationDispatcher &MD,
-         FuzzingOptions Options);
+  Fuzzer(UserCallback CB, InputCorpus *Corpus, MutationDispatcher &MD,
+            FuzzingOptions Options);
+  Fuzzer(UserCallbackCore CBCore, InputCorpus *Corpus, MutationDispatcher &MD,
+            FuzzingOptions Options);
   ~Fuzzer();
   void Loop(Vector<SizedFile> &CorporaFiles);
+
   void ReadAndExecuteSeedCorpora(Vector<SizedFile> &CorporaFiles);
   void MinimizeCrashLoop(const Unit &U);
   void RereadOutputCorpus(size_t MaxSize);
 
+  void LoopPyCore(Vector<SizedFile> &CorporaFiles, GetSpecifiedSeed CbSpecified);
+  int RunOneScript(const char *Script);
+  void ExecuteCBCore(const char *Script);
+  void PrintPulseAndReportSlowInput(const char *Script);
+  void SetFuzzer (UserCallback CB, InputCorpus *Corpus);
+
+  size_t GetCov ();
+  size_t AppNum;
+  
   size_t secondsSinceProcessStartUp() {
     return duration_cast<seconds>(system_clock::now() - ProcessStartTime)
         .count();
   }
 
+  inline size_t SecondsDuration() {
+    return duration_cast<seconds>(system_clock::now() - LastUpdateTime).count();
+  }
+
+  inline void SetLastUpdateTime () {
+    LastUpdateTime = system_clock::now();
+    return;
+  }
+
   bool TimedOut() {
-    return Options.MaxTotalTimeSec > 0 &&
-           secondsSinceProcessStartUp() >
-               static_cast<size_t>(Options.MaxTotalTimeSec);
+    if (Options.MaxTotalTimeSec <= 0) {
+      return false;
+    }
+    else {
+      size_t LastUpdateTime = SecondsDuration();
+      if (LastUpdateTime > static_cast<size_t>(Options.MaxTotalTimeSec)) {
+          return true;
+      }
+      else {
+        return false;
+      }
+    }
   }
 
   size_t execPerSec() {
@@ -85,9 +115,12 @@ public:
 
   void HandleMalloc(size_t Size);
   static void MaybeExitGracefully();
-  std::string WriteToOutputCorpus(const Unit &U);
+  std::string WriteToOutputCorpus(const Unit &U, bool IsLv2=true);
 
 private:
+  void InitFuzzer ();
+  void MutatePyAndTest(const char* Script, GetSpecifiedSeed CbSpecified);
+  
   void AlarmCallback();
   void CrashCallback();
   void ExitCallback();
@@ -95,7 +128,7 @@ private:
   void InterruptCallback();
   void MutateAndTestOne();
   void PurgeAllocator();
-  void ReportNewCoverage(InputInfo *II, const Unit &U);
+  void ReportNewCoverage(InputInfo *II, const Unit &U, bool IsLv2=true);
   void PrintPulseAndReportSlowInput(const uint8_t *Data, size_t Size);
   void WriteUnitToFileWithPrefix(const Unit &U, const char *Prefix);
   void PrintStats(const char *Where, const char *End = "\n", size_t Units = 0,
@@ -125,12 +158,17 @@ private:
   system_clock::time_point LastAllocatorPurgeAttemptTime = system_clock::now();
 
   UserCallback CB;
-  InputCorpus &Corpus;
+  InputCorpus *Corpus;
   MutationDispatcher &MD;
   FuzzingOptions Options;
   DataFlowTrace DFT;
 
+  UserCallbackCore CBCore;
+  InputCorpus *PyCorpus;
+
   system_clock::time_point ProcessStartTime = system_clock::now();
+  system_clock::time_point LastUpdateTime = system_clock::now();
+
   system_clock::time_point UnitStartTime, UnitStopTime;
   long TimeOfLongestUnitInSeconds = 0;
   long EpochOfLastReadOfOutputCorpus = 0;
@@ -143,7 +181,12 @@ private:
 
   // Need to know our own thread.
   static thread_local bool IsMyThread;
+
+  const char* PyCurScript;
 };
+
+
+Fuzzer* GetFuzzer ();
 
 struct ScopedEnableMsanInterceptorChecks {
   ScopedEnableMsanInterceptorChecks() {

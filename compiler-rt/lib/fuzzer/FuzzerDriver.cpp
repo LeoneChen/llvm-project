@@ -85,6 +85,9 @@ static const size_t kNumFlags =
 static Vector<std::string> *Inputs;
 static std::string *ProgName;
 
+static bool TwoLvFuzzing = false;
+static FuzzingOptions Options;
+
 static void PrintHelp() {
   Printf("Usage:\n");
   auto Prog = ProgName->c_str();
@@ -590,11 +593,11 @@ Vector<std::string> ParseSeedInuts(const char *seed_inputs) {
 }
 
 static Vector<SizedFile> ReadCorpora(const Vector<std::string> &CorpusDirs,
-    const Vector<std::string> &ExtraSeedFiles) {
+    const Vector<std::string> &ExtraSeedFiles, std::string Suffix="") {
   Vector<SizedFile> SizedFiles;
   size_t LastNumFiles = 0;
   for (auto &Dir : CorpusDirs) {
-    GetSizedFilesFromDir(Dir, &SizedFiles);
+    GetSizedFilesFromDir(Dir, &SizedFiles, Suffix);
     Printf("INFO: % 8zd files found in %s\n", SizedFiles.size() - LastNumFiles,
            Dir.c_str());
     LastNumFiles = SizedFiles.size();
@@ -605,7 +608,49 @@ static Vector<SizedFile> ReadCorpora(const Vector<std::string> &CorpusDirs,
   return SizedFiles;
 }
 
-int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
+static std::string GetAppName (std::string Seed)
+{
+  // crash-3#turtledemo#round_dance#stop.py-da39a3ee5e6b4b0d3255bfef95601890afd80709
+  size_t SPos = Seed.find_first_of('#');
+  if (SPos == std::string::npos)
+    return "";
+
+  size_t EPos = Seed.find_last_of('-');
+  if (EPos == std::string::npos)
+    return "";
+
+  std::string AppName = "1" + Seed.substr (SPos, EPos-SPos);
+
+  return AppName;
+}
+
+static void GetAbmSeeds(Vector<std::string> *AbmlSeeds) {
+  Vector<SizedFile> SizedFiles;
+  GetAbmlSeedsFromDir(".", &SizedFiles);
+  for (auto &SFile : SizedFiles) {
+    std::string AppName = GetAppName (SFile.File);
+    AbmlSeeds->push_back (AppName);
+  }
+
+  FILE *F = fopen ("History.hty", "r");
+  if (F != NULL) {
+    while (!feof(F)) {
+      char Buf[256] = {0};
+      fgets(Buf, sizeof (Buf), F);
+
+      char *EPos = strstr(Buf, ".py");
+      if (EPos == NULL)
+        continue;
+      EPos[3] = 0;
+      
+      printf ("Read from His: %s\r\n", Buf);
+      AbmlSeeds->push_back (std::string(Buf));
+    }
+    fclose (F);
+  }
+}
+
+int FuzzerDriverOrigin(int *argc, char ***argv, UserCallback Callback) {
   using namespace fuzzer;
   assert(argc && argv && "Argument pointers cannot be nullptr");
   std::string Argv0((*argv)[0]);
@@ -724,6 +769,7 @@ int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
            Options.EntropicFeatureFrequencyThreshold,
            Options.EntropicNumberOfRarestFeatures);
   }
+
   struct EntropicOptions Entropic;
   Entropic.Enabled = Options.Entropic;
   Entropic.FeatureFrequencyThreshold =
@@ -750,7 +796,7 @@ int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
   Random Rand(Seed);
   auto *MD = new MutationDispatcher(Rand, Options);
   auto *Corpus = new InputCorpus(Options.OutputCorpus, Entropic);
-  auto *F = new Fuzzer(Callback, *Corpus, *MD, Options);
+  auto *F = new Fuzzer(Callback, Corpus, *MD, Options);
 
   for (auto &U: Dictionary)
     if (U.size() <= Word::GetMaxSize())
@@ -853,6 +899,297 @@ int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
 
   exit(0);  // Don't let F destroy itself.
 }
+
+
+int FuzzerDriverPyCoreLv2 (int *argc, char ***argv, UserCallback Callback) { 
+  using namespace fuzzer;
+
+  const Vector<std::string> Args(*argv, *argv + *argc);
+  ParseFlags(Args, EF);
+  Options.OutputCorpus = (*Inputs)[0];
+
+  bool RunIndividualFiles = AllInputsAreFiles();
+
+  struct EntropicOptions Entropic;
+  Entropic.Enabled = Options.Entropic;
+  Entropic.FeatureFrequencyThreshold = Options.EntropicFeatureFrequencyThreshold;
+  Entropic.NumberOfRarestFeatures = Options.EntropicNumberOfRarestFeatures;
+ 
+  unsigned Seed = Flags.seed;
+  // Initialize Seed.
+  if (Seed == 0)
+    Seed =
+        std::chrono::system_clock::now().time_since_epoch().count() + GetPid();
+  if (Flags.verbosity)
+    Printf("INFO: Seed: %u\n", Seed);
+
+  if (Flags.collect_data_flow && !Flags.fork && !Flags.merge) {
+    if (RunIndividualFiles)
+      return CollectDataFlow(Flags.collect_data_flow, Flags.data_flow_trace,
+                        ReadCorpora({}, *Inputs));
+    else
+      return CollectDataFlow(Flags.collect_data_flow, Flags.data_flow_trace,
+                        ReadCorpora(*Inputs, {}));
+  }
+
+  Random Rand(Seed);
+  auto *Corpus = new InputCorpus(Options.OutputCorpus, Entropic);
+
+  Fuzzer *F = fuzzer::GetFuzzer();
+  assert (F != NULL);
+  F->SetFuzzer(Callback, Corpus);
+
+  auto CorporaFiles = ReadCorpora(*Inputs, ParseSeedInuts(Flags.seed_inputs));
+  F->Loop(CorporaFiles);
+
+  if (Flags.verbosity)
+    Printf("Level2-Done %zd runs in %zd second(s)\n", F->getTotalNumberOfRuns(),
+           F->secondsSinceProcessStartUp());
+  F->PrintFinalStats();
+
+  return 0;
+}
+
+
+int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
+  if (TwoLvFuzzing) {
+    return FuzzerDriverPyCoreLv2 (argc, argv, Callback);
+  }
+  else {
+    return FuzzerDriverOrigin (argc, argv, Callback);
+  }
+}
+
+
+void DisorderCorpus (Vector<SizedFile>& VecCorpus)
+{
+  Vector<std::string> AbmlSeeds;
+  GetAbmSeeds (&AbmlSeeds);
+
+  Vector<SizedFile> NoneTouchSeeds;
+  Vector<SizedFile> TouchVSeeds;
+  for (auto &Vc : VecCorpus) {
+    std::string AppName = std::string(basename (Vc.File.c_str()));
+    
+    size_t SPos = AppName.find_first_of('#');
+    if (SPos == std::string::npos)
+      continue;
+    std::string FName = "1" + AppName.substr (SPos);
+    //printf ("### AppName: %s  ----> FName:%s\r\n", AppName.c_str(), FName.c_str());
+
+    auto Item = std::find(AbmlSeeds.begin(), AbmlSeeds.end(), FName);
+    if (Item != AbmlSeeds.end()) {
+      TouchVSeeds.push_back (Vc);
+    }
+    else{
+      NoneTouchSeeds.push_back (Vc);
+    }
+  }
+  
+  size_t IterNum = NoneTouchSeeds.size();
+  if (IterNum == 0)
+    return;
+  
+  if (Options.DisorderPyScript) {
+    std::srand((unsigned)time(NULL));
+    for (size_t iter = 0; iter < IterNum; iter++) {
+      int Pos1 = std::rand() % IterNum;
+      int Pos2 = std::rand() % IterNum;
+
+      if (Pos1 != Pos2) {
+        SizedFile Tmp    = NoneTouchSeeds [Pos1];
+        NoneTouchSeeds [Pos1] = NoneTouchSeeds [Pos2];
+        NoneTouchSeeds [Pos2] = Tmp;
+      }
+    }
+  }
+
+  VecCorpus.clear();
+  VecCorpus.insert(VecCorpus.end(), NoneTouchSeeds.begin(), NoneTouchSeeds.end());
+  //VecCorpus.insert(VecCorpus.end(), TouchVSeeds.begin(), TouchVSeeds.end());
+
+  return;
+}
+
+int FuzzerDriverPyCore(int *argc, char ***argv, 
+                       UserCallbackCore Callback,
+                       GetRandomSeed CbRandom,
+                       GetSpecifiedSeed CbSpecified,
+                       UserMutator CbUserMutator) {
+  using namespace fuzzer;
+  assert(argc && argv && "Argument pointers cannot be nullptr");
+  std::string Argv0((*argv)[0]);
+  EF = new ExternalFunctions();
+  EF->LLVMFuzzerCustomMutator = CbUserMutator;
+
+  if (EF->LLVMFuzzerInitialize)
+    EF->LLVMFuzzerInitialize(argc, argv);
+  if (EF->__msan_scoped_disable_interceptor_checks)
+    EF->__msan_scoped_disable_interceptor_checks();
+  const Vector<std::string> Args(*argv, *argv + *argc);
+  assert(!Args.empty());
+  ProgName = new std::string(Args[0]);
+  if (Argv0 != *ProgName) {
+    Printf("ERROR: argv[0] has been modified in LLVMFuzzerInitialize\n");
+    exit(1);
+  }
+  ParseFlags(Args, EF);
+  if (Flags.help) {
+    PrintHelp();
+    return 0;
+  }
+
+  Options.Verbosity = Flags.verbosity;
+  Options.MaxLen = Flags.max_len;
+  Options.LenControl = Flags.len_control;
+  Options.UnitTimeoutSec = Flags.timeout;
+  Options.ErrorExitCode = Flags.error_exitcode;
+  Options.TimeoutExitCode = Flags.timeout_exitcode;
+  Options.IgnoreTimeouts = Flags.ignore_timeouts;
+  Options.IgnoreOOMs = Flags.ignore_ooms;
+  Options.IgnoreCrashes = Flags.ignore_crashes;
+  Options.MaxTotalTimeSec = Flags.max_total_time;
+  Options.DoCrossOver = Flags.cross_over;
+  Options.MutateDepth = Flags.mutate_depth;
+  Options.ReduceDepth = Flags.reduce_depth;
+  Options.UseCounters = Flags.use_counters;
+  Options.UseMemmem = Flags.use_memmem;
+  Options.UseCmp = Flags.use_cmp;
+  Options.UseValueProfile = Flags.use_value_profile;
+  Options.Shrink = Flags.shrink;
+  Options.ReduceInputs = Flags.reduce_inputs;
+  Options.ShuffleAtStartUp = Flags.shuffle;
+  Options.PreferSmall = Flags.prefer_small;
+  Options.ReloadIntervalSec = Flags.reload;
+  Options.OnlyASCII = Flags.only_ascii;
+  Options.DetectLeaks = Flags.detect_leaks;
+  Options.PurgeAllocatorIntervalSec = Flags.purge_allocator_interval;
+  Options.TraceMalloc = Flags.trace_malloc;
+  Options.RssLimitMb = Flags.rss_limit_mb;
+  Options.MallocLimitMb = Flags.malloc_limit_mb;
+  if (!Options.MallocLimitMb)
+    Options.MallocLimitMb = Options.RssLimitMb;
+  if (Flags.runs >= 0)
+    Options.MaxNumberOfRuns = Flags.runs;
+  if (!Inputs->empty() && !Flags.minimize_crash_internal_step)
+    Options.OutputCorpus = (*Inputs)[0];
+  Options.ReportSlowUnits = Flags.report_slow_units;
+  if (Flags.artifact_prefix)
+    Options.ArtifactPrefix = Flags.artifact_prefix;
+  if (Flags.exact_artifact_path)
+    Options.ExactArtifactPath = Flags.exact_artifact_path;
+
+  bool RunIndividualFiles = AllInputsAreFiles();
+  Options.SaveArtifacts =
+      !RunIndividualFiles || Flags.minimize_crash_internal_step;
+  Options.PrintNewCovPcs = Flags.print_pcs;
+  Options.PrintNewCovFuncs = Flags.print_funcs;
+  Options.PrintFinalStats = Flags.print_final_stats;
+  Options.PrintCorpusStats = Flags.print_corpus_stats;
+  Options.PrintCoverage = Flags.print_coverage;
+  if (Flags.exit_on_src_pos)
+    Options.ExitOnSrcPos = Flags.exit_on_src_pos;
+  if (Flags.exit_on_item)
+    Options.ExitOnItem = Flags.exit_on_item;
+  if (Flags.focus_function)
+    Options.FocusFunction = Flags.focus_function;
+  if (Flags.data_flow_trace)
+    Options.DataFlowTrace = Flags.data_flow_trace;
+  if (Flags.features_dir)
+    Options.FeaturesDir = Flags.features_dir;
+  if (Flags.collect_data_flow)
+    Options.CollectDataFlow = Flags.collect_data_flow;
+  if (Flags.stop_file)
+    Options.StopFile = Flags.stop_file;
+  Options.Entropic = Flags.entropic;
+  Options.EntropicFeatureFrequencyThreshold =
+      (size_t)Flags.entropic_feature_frequency_threshold;
+  Options.EntropicNumberOfRarestFeatures =
+      (size_t)Flags.entropic_number_of_rarest_features;
+
+  struct EntropicOptions Entropic;
+  Entropic.Enabled = Options.Entropic;
+  Entropic.FeatureFrequencyThreshold =
+      Options.EntropicFeatureFrequencyThreshold;
+  Entropic.NumberOfRarestFeatures = Options.EntropicNumberOfRarestFeatures;
+
+  unsigned Seed = Flags.seed;
+  // Initialize Seed.
+  if (Seed == 0)
+    Seed = std::chrono::system_clock::now().time_since_epoch().count() + GetPid();
+  if (Flags.verbosity)
+    Printf("INFO: Seed: %u\n", Seed);
+
+  if (Flags.collect_data_flow && !Flags.fork && !Flags.merge) {
+    if (RunIndividualFiles)
+      return CollectDataFlow(Flags.collect_data_flow, Flags.data_flow_trace,
+                        ReadCorpora({}, *Inputs));
+    else
+      return CollectDataFlow(Flags.collect_data_flow, Flags.data_flow_trace,
+                        ReadCorpora(*Inputs, {}));
+  }
+
+  Random Rand(Seed);
+  auto *MD = new MutationDispatcher(Rand, Options);
+  auto *Corpus = new InputCorpus (Options.OutputCorpus, Entropic);
+  auto *F = new Fuzzer(Callback, Corpus, *MD, Options);
+  TwoLvFuzzing = true;
+  Options.DisorderPyScript = Flags.disorder;
+  Printf("### INFO: Options.DisorderPyScript: %u\n", Options.DisorderPyScript);
+
+  Options.HandleAbrt = Flags.handle_abrt;
+  Options.HandleBus = Flags.handle_bus;
+  Options.HandleFpe = Flags.handle_fpe;
+  Options.HandleIll = Flags.handle_ill;
+  Options.HandleInt = Flags.handle_int;
+  Options.HandleSegv = Flags.handle_segv;
+  Options.HandleTerm = Flags.handle_term;
+  Options.HandleXfsz = Flags.handle_xfsz;
+  Options.HandleUsr1 = Flags.handle_usr1;
+  Options.HandleUsr2 = Flags.handle_usr2;
+  SetSignalHandler(Options);
+  std::atexit(Fuzzer::StaticExitCallback);
+
+  // for python interpreter fuzzing
+  // we need to maintain two-level seed queue
+  if (Flags.pyscript == NULL) {
+    Printf("***\n"
+           "*** Warning: please specifiy the input corpus with -pyscript=***\n"
+           "***\n");
+    exit(0);
+  }
+  printf ("### [Level-1] Load init scripts from: %s\r\n", Flags.pyscript);
+  
+  if (IsFile(Flags.pyscript) == true) {
+    Vector<SizedFile> CorporaFiles;
+    if (size_t Size = FileSize(Flags.pyscript))
+      CorporaFiles.push_back({Flags.pyscript, Size});
+    F->LoopPyCore(CorporaFiles, CbSpecified);
+  }
+  else {
+    Inputs->push_back (Flags.pyscript);
+    auto CorporaFiles = ReadCorpora(*Inputs, ParseSeedInuts(Flags.seed_inputs), ".py");
+    DisorderCorpus (CorporaFiles);
+    F->LoopPyCore(CorporaFiles, CbSpecified);
+  }
+
+  if (Flags.verbosity)
+    Printf("Level1-Done %zd runs in %zd second(s)\n", F->getTotalNumberOfRuns(),
+           F->secondsSinceProcessStartUp());
+  F->PrintFinalStats();
+
+  exit(0);  // Don't let F destroy itself.
+}
+
+int FuzzerGetCovUpdateDuration()
+{
+  Fuzzer *F = fuzzer::GetFuzzer();
+  int Last = (int)F->SecondsDuration();
+  
+  //printf ("####[FuzzerGetCovUpdateDuration] duration = %u\r\n", Last);
+  return int (Last<<16 | Options.MaxTotalTimeSec);
+}
+
 
 // Storage for global ExternalFunctions object.
 ExternalFunctions *EF = nullptr;
