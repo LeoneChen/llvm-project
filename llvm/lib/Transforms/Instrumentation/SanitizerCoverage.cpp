@@ -153,6 +153,14 @@ static cl::opt<bool>
                 cl::desc("collect control flow for each function"), cl::Hidden,
                 cl::init(false));
 
+static cl::list<std::string>
+    ClCoverageAllowlist("sanitizer-coverage-allowlist",
+                        cl::desc("Sanitizer Coverage Allowlist"), cl::Hidden);
+
+static cl::list<std::string>
+    ClCoverageBlocklist("sanitizer-coverage-blocklist",
+                        cl::desc("Sanitizer Coverage Blocklist"), cl::Hidden);
+
 namespace {
 
 SanitizerCoverageOptions getOptions(int LegacyCoverageLevel) {
@@ -287,6 +295,18 @@ private:
 
 PreservedAnalyses SanitizerCoveragePass::run(Module &M,
                                              ModuleAnalysisManager &MAM) {
+  if (Allowlist == nullptr and ClCoverageAllowlist.size() > 0) {
+    std::vector<std::string> AllowlistFiles(ClCoverageAllowlist.begin(),
+                                            ClCoverageAllowlist.end());
+    Allowlist =
+        SpecialCaseList::createOrDie(AllowlistFiles, *vfs::getRealFileSystem());
+  }
+  if (Blocklist == nullptr && ClCoverageBlocklist.size() > 0) {
+    std::vector<std::string> BlocklistFiles(ClCoverageBlocklist.begin(),
+                                            ClCoverageBlocklist.end());
+    Blocklist =
+        SpecialCaseList::createOrDie(BlocklistFiles, *vfs::getRealFileSystem());
+  }
   ModuleSanitizerCoverage ModuleSancov(Options, Allowlist.get(),
                                        Blocklist.get());
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
