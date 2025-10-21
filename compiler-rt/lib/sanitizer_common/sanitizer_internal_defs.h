@@ -486,5 +486,8 @@ using namespace __sanitizer;
 namespace __memprof {
 using namespace __sanitizer;
 }
+namespace __slsan {
+using namespace __sanitizer;
+} // namespace __slsan
 
 #endif  // SANITIZER_DEFS_H

@@ -1444,6 +1444,10 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
   if (SanArgs.needsAsanRt())
     HelperStaticRuntimes.push_back("asan_static");
 
+  if (SanArgs.needsSlsanRt()) {
+    HelperStaticRuntimes.push_back("slsan_static");
+  }
+
   // Collect static runtimes.
   if (Args.hasArg(options::OPT_shared)) {
     // Don't link static runtimes into DSOs.
@@ -1489,6 +1493,10 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
     StaticRuntimes.push_back("tsan");
     if (SanArgs.linkCXXRuntimes())
       StaticRuntimes.push_back("tsan_cxx");
+  }
+  if (!SanArgs.needsSharedRt() && SanArgs.needsSlsanRt() &&
+      SanArgs.linkRuntimes()) {
+    StaticRuntimes.push_back("slsan");
   }
   if (!SanArgs.needsSharedRt() && SanArgs.needsUbsanRt()) {
     if (SanArgs.requiresMinimalRuntime()) {

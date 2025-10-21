@@ -80,6 +80,7 @@ public:
 
   bool needsMemProfRt() const { return NeedsMemProfRt; }
   bool needsAsanRt() const { return Sanitizers.has(SanitizerKind::Address); }
+  bool needsSlsanRt() const { return Sanitizers.has(SanitizerKind::SGXLogic); }
   bool needsHwasanRt() const {
     return Sanitizers.has(SanitizerKind::HWAddress);
   }
