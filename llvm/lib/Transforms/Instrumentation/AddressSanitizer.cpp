@@ -419,6 +419,10 @@ static cl::opt<int> ClDebugMin("asan-debug-min", cl::desc("Debug min inst"),
 static cl::opt<int> ClDebugMax("asan-debug-max", cl::desc("Debug max inst"),
                                cl::Hidden, cl::init(-1));
 
+static cl::opt<bool> ClEnclave("asan-enclave",
+                               cl::desc("Enable instrumentation for enclave"),
+                               cl::Hidden, cl::init(false));
+
 STATISTIC(NumInstrumentedReads, "Number of instrumented reads");
 STATISTIC(NumInstrumentedWrites, "Number of instrumented writes");
 STATISTIC(NumOptimizedAccessesToGlobalVar,
@@ -439,6 +443,49 @@ struct ShadowMapping {
   bool OrShadowOffset;
   bool InGlobal;
 };
+
+Function *getCalledFunctionStripPointerCast(CallInst *CallI) {
+  if (Function *callee = CallI->getCalledFunction()) {
+    return callee;
+  } else if (Value *calledOp = CallI->getCalledOperand()) {
+    if (auto callee = dyn_cast<Function>(calledOp->stripPointerCasts())) {
+      return callee;
+    }
+  }
+  return nullptr;
+}
+
+StringRef getDirectCalleeName(Value *value) {
+  if (auto CI = dyn_cast<CallInst>(value)) {
+    if (auto callee = getCalledFunctionStripPointerCast(CI)) {
+      return callee->getName();
+    }
+  }
+  return "";
+}
+
+SmallVector<User *> getNonCastUsers(Value *value) {
+  SmallVector<User *> users;
+  for (User *user : value->users()) {
+    if (CastInst *CastI = dyn_cast<CastInst>(user)) {
+      users.append(getNonCastUsers(CastI));
+    } else {
+      users.push_back(user);
+    }
+  }
+  return users;
+}
+
+bool hasCmpUser(Value *val) {
+  for (auto user : getNonCastUsers(val)) {
+    auto I = dyn_cast<Instruction>(user);
+    if (I && (I->getOpcode() == Instruction::ICmp ||
+              I->getOpcode() == Instruction::FCmp)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 } // end anonymous namespace
 
@@ -678,6 +725,16 @@ struct AddressSanitizer {
   bool maybeInsertAsanInitAtFunctionEntry(Function &F);
   bool maybeInsertDynamicShadowAtFunctionEntry(Function &F);
   void markEscapedLocalAllocas(Function &F);
+  /// \brief Instrument hooked library calls (memcpy_s, snprintf, etc.)
+  void instrumentHookedCall(CallInst *CI) {
+    Function *Callee = getCalledFunctionStripPointerCast(CI);
+    assert(Callee && "instrumentHookedCall: callee must be a direct function");
+    StringRef callee_name = Callee->getName();
+    std::string wrapper_name = ("__sgxsan_" + callee_name).str();
+    FunctionCallee Wrapper = CI->getModule()->getOrInsertFunction(
+        wrapper_name, Callee->getFunctionType());
+    CI->setCalledFunction(Wrapper);
+  }
 
 private:
   friend struct FunctionStackPoisoner;
@@ -1743,8 +1800,13 @@ void AddressSanitizer::instrumentAddress(Instruction *OrigIns,
 
   if (UseCalls) {
     if (Exp == 0)
-      IRB.CreateCall(AsanMemoryAccessCallback[IsWrite][0][AccessSizeIndex],
-                     AddrLong);
+      if (ClEnclave) {
+        IRB.CreateCall(AsanMemoryAccessCallback[IsWrite][0][AccessSizeIndex],
+                       {AddrLong, IRB.getInt1(hasCmpUser(OrigIns))});
+      } else {
+        IRB.CreateCall(AsanMemoryAccessCallback[IsWrite][0][AccessSizeIndex],
+                       AddrLong);
+      }
     else
       IRB.CreateCall(AsanMemoryAccessCallback[IsWrite][1][AccessSizeIndex],
                      {AddrLong, ConstantInt::get(IRB.getInt32Ty(), Exp)});
@@ -1802,8 +1864,13 @@ void AddressSanitizer::instrumentUnusualSizeOrAlignment(
   Value *AddrLong = IRB.CreatePointerCast(Addr, IntptrTy);
   if (UseCalls) {
     if (Exp == 0)
-      IRB.CreateCall(AsanMemoryAccessCallbackSized[IsWrite][0],
-                     {AddrLong, Size});
+      if (ClEnclave) {
+        IRB.CreateCall(AsanMemoryAccessCallbackSized[IsWrite][0],
+                       {AddrLong, Size, IRB.getInt1(hasCmpUser(I))});
+      } else {
+        IRB.CreateCall(AsanMemoryAccessCallbackSized[IsWrite][0],
+                       {AddrLong, Size});
+      }
     else
       IRB.CreateCall(AsanMemoryAccessCallbackSized[IsWrite][1],
                      {AddrLong, Size, ConstantInt::get(IRB.getInt32Ty(), Exp)});
@@ -2641,9 +2708,17 @@ void AddressSanitizer::initializeCallbacks(Module &M) {
           kAsanReportErrorTemplate + ExpStr + TypeStr + "_n" + EndingStr,
           FunctionType::get(IRB.getVoidTy(), Args2, false));
 
-      AsanMemoryAccessCallbackSized[AccessIsWrite][Exp] = M.getOrInsertFunction(
-          ClMemoryAccessCallbackPrefix + ExpStr + TypeStr + "N" + EndingStr,
-          FunctionType::get(IRB.getVoidTy(), Args2, false));
+      if (ClEnclave && !Exp) {
+        AsanMemoryAccessCallbackSized[AccessIsWrite][0] = M.getOrInsertFunction(
+            ClMemoryAccessCallbackPrefix + ExpStr + TypeStr + "N" + EndingStr,
+            FunctionType::get(IRB.getVoidTy(),
+                              {IntptrTy, IntptrTy, Type::getInt1Ty(*C)},
+                              false));
+      } else {
+        AsanMemoryAccessCallbackSized[AccessIsWrite][Exp] = M.getOrInsertFunction(
+            ClMemoryAccessCallbackPrefix + ExpStr + TypeStr + "N" + EndingStr,
+            FunctionType::get(IRB.getVoidTy(), Args2, false));
+      }
 
       for (size_t AccessSizeIndex = 0; AccessSizeIndex < kNumberOfAccessSizes;
            AccessSizeIndex++) {
@@ -2653,10 +2728,18 @@ void AddressSanitizer::initializeCallbacks(Module &M) {
                 kAsanReportErrorTemplate + ExpStr + Suffix + EndingStr,
                 FunctionType::get(IRB.getVoidTy(), Args1, false));
 
-        AsanMemoryAccessCallback[AccessIsWrite][Exp][AccessSizeIndex] =
-            M.getOrInsertFunction(
-                ClMemoryAccessCallbackPrefix + ExpStr + Suffix + EndingStr,
-                FunctionType::get(IRB.getVoidTy(), Args1, false));
+        if (ClEnclave && !Exp) {
+          AsanMemoryAccessCallback[AccessIsWrite][0][AccessSizeIndex] =
+              M.getOrInsertFunction(
+                  ClMemoryAccessCallbackPrefix + ExpStr + Suffix + EndingStr,
+                  FunctionType::get(IRB.getVoidTy(),
+                                    {IntptrTy, Type::getInt1Ty(*C)}, false));
+        }else {
+          AsanMemoryAccessCallback[AccessIsWrite][Exp][AccessSizeIndex] =
+              M.getOrInsertFunction(
+                  ClMemoryAccessCallbackPrefix + ExpStr + Suffix + EndingStr,
+                  FunctionType::get(IRB.getVoidTy(), Args1, false));
+        }
       }
     }
   }
@@ -2777,6 +2860,9 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   if (F.getLinkage() == GlobalValue::AvailableExternallyLinkage) return false;
   if (!ClDebugFunc.empty() && ClDebugFunc == F.getName()) return false;
   if (F.getName().startswith("__asan_")) return false;
+  if (ClEnclave && (F.getName().startswith("sgx_sgxsan_ecall") ||
+                    F.getName().startswith("sgxsan_ocall")))
+    return false;
 
   bool FunctionModified = false;
 
@@ -2809,6 +2895,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   SmallVector<Instruction *, 8> NoReturnCalls;
   SmallVector<BasicBlock *, 16> AllBlocks;
   SmallVector<Instruction *, 16> PointerComparisonsOrSubtracts;
+  SmallVector<CallInst *, 16> HookedCallsToInstrument;
   int NumAllocas = 0;
 
   // Fill the set of memory operations to instrument.
@@ -2859,6 +2946,40 @@ bool AddressSanitizer::instrumentFunction(Function &F,
         if (CallInst *CI = dyn_cast<CallInst>(&Inst))
           maybeMarkSanitizerLibraryCallNoBuiltin(CI, TLI);
       }
+      if (CallInst *CI = dyn_cast<CallInst>(&Inst)) {
+        StringRef callee_name = getDirectCalleeName(CI);
+        // Check if this is a memory/string function that needs hooking
+        bool needsHooking =
+            // Safe memory functions (_s variants from Microsoft/Intel SafeCRT)
+            callee_name == "memcpy_s" || callee_name == "memset_s" ||
+            callee_name == "memmove_s" ||
+            // Fixed-size memory operations
+            callee_name == "memcmp" || callee_name == "memchr" ||
+            callee_name == "bcmp" ||
+            // Fixed-size string operations
+            callee_name == "strncpy" || callee_name == "strlcpy" ||
+            callee_name == "strncmp" || callee_name == "strnlen" ||
+            callee_name == "strncat" || callee_name == "stpncpy" ||
+            callee_name == "strndup" ||
+            // BSD/Legacy memory operations
+            callee_name == "bzero" || callee_name == "bcopy" ||
+            callee_name == "mempcpy" ||
+            // Safe string functions (_s variants)
+            callee_name == "strcpy_s" || callee_name == "strncpy_s" ||
+            callee_name == "strcat_s" || callee_name == "strncat_s" ||
+            // Formatting functions
+            callee_name == "snprintf" || callee_name == "vsnprintf" ||
+            callee_name == "sprintf_s" || callee_name == "_snprintf_s" ||
+            // NUL-terminated string operations
+            callee_name == "strlen" || callee_name == "strcmp" ||
+            callee_name == "strchr" || callee_name == "strrchr" ||
+            callee_name == "strstr" || callee_name == "strspn" ||
+            callee_name == "strcspn" || callee_name == "strpbrk";
+
+        if (needsHooking) {
+          HookedCallsToInstrument.push_back(CI);
+        }
+      }
       if (NumInsnsPerBB >= ClMaxInsnsToInstrumentPerBB) break;
     }
   }
@@ -2866,6 +2987,8 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   bool UseCalls = (ClInstrumentationWithCallsThreshold >= 0 &&
                    OperandsToInstrument.size() + IntrinToInstrument.size() >
                        (unsigned)ClInstrumentationWithCallsThreshold);
+  if (ClEnclave)
+    UseCalls = true;
   const DataLayout &DL = F.getParent()->getDataLayout();
   ObjectSizeOpts ObjSizeOpts;
   ObjSizeOpts.RoundToAlign = true;
@@ -2883,6 +3006,13 @@ bool AddressSanitizer::instrumentFunction(Function &F,
     if (!suppressInstrumentationSiteForDebug(NumInstrumented))
       instrumentMemIntrinsic(Inst);
     FunctionModified = true;
+  }
+  if (ClEnclave) {
+    for (auto CI : HookedCallsToInstrument) {
+      if (!suppressInstrumentationSiteForDebug(NumInstrumented))
+        instrumentHookedCall(CI);
+      FunctionModified = true;
+    }
   }
 
   FunctionStackPoisoner FSP(F, *this);
