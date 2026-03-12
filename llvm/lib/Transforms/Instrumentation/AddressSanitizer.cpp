@@ -92,13 +92,15 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "asan"
+const uint8_t kSGXSanInEnclaveMagic = 0x40;
+const uint8_t kSGXSanL1Filter = 0x8F;
 
 static const uint64_t kDefaultShadowScale = 3;
 static const uint64_t kDefaultShadowOffset32 = 1ULL << 29;
 static const uint64_t kDefaultShadowOffset64 = 1ULL << 44;
 static const uint64_t kDynamicShadowSentinel =
     std::numeric_limits<uint64_t>::max();
-static const uint64_t kSmallX86_64ShadowOffsetBase = 0x7FFFFFFF;  // < 2G.
+static const uint64_t kSmallX86_64ShadowOffsetBase = 0x18000000000; // 1.5T.
 static const uint64_t kSmallX86_64ShadowOffsetAlignMask = ~0xFFFULL;
 static const uint64_t kLinuxKasan_ShadowOffset64 = 0xdffffc0000000000;
 static const uint64_t kPPC64_ShadowOffset64 = 1ULL << 44;
@@ -192,7 +194,7 @@ static cl::opt<bool> ClRecover(
 static cl::opt<bool> ClInsertVersionCheck(
     "asan-guard-against-version-mismatch",
     cl::desc("Guard against compiler/runtime version mismatch."),
-    cl::Hidden, cl::init(true));
+    cl::Hidden, cl::init(false));
 
 // This flag may need to be replaced with -f[no-]asan-reads.
 static cl::opt<bool> ClInstrumentReads("asan-instrument-reads",
@@ -284,7 +286,7 @@ static cl::opt<bool> ClGlobals("asan-globals",
 
 static cl::opt<bool> ClInitializers("asan-initialization-order",
                                     cl::desc("Handle C++ initializer order"),
-                                    cl::Hidden, cl::init(true));
+                                    cl::Hidden, cl::init(false));
 
 static cl::opt<bool> ClInvalidPointerPairs(
     "asan-detect-invalid-pointer-pair",
@@ -363,7 +365,7 @@ static cl::opt<bool> ClOptStack(
 static cl::opt<bool> ClDynamicAllocaStack(
     "asan-stack-dynamic-alloca",
     cl::desc("Use dynamic alloca to represent stack variables"), cl::Hidden,
-    cl::init(true));
+    cl::init(false));
 
 static cl::opt<uint32_t> ClForceExperiment(
     "asan-force-experiment",
@@ -384,14 +386,14 @@ static cl::opt<bool>
     ClUseGlobalsGC("asan-globals-live-support",
                    cl::desc("Use linker features to support dead "
                             "code stripping of globals"),
-                   cl::Hidden, cl::init(true));
+                   cl::Hidden, cl::init(false));
 
 // This is on by default even though there is a bug in gold:
 // https://sourceware.org/bugzilla/show_bug.cgi?id=19002
 static cl::opt<bool>
     ClWithComdat("asan-with-comdat",
                  cl::desc("Place ASan constructors in comdat sections"),
-                 cl::Hidden, cl::init(true));
+                 cl::Hidden, cl::init(false));
 
 static cl::opt<AsanDtorKind> ClOverrideDestructorKind(
     "asan-destructor-kind",
@@ -419,6 +421,10 @@ static cl::opt<int> ClDebugMin("asan-debug-min", cl::desc("Debug min inst"),
 static cl::opt<int> ClDebugMax("asan-debug-max", cl::desc("Debug max inst"),
                                cl::Hidden, cl::init(-1));
 
+static cl::opt<bool> ClEnclave("asan-enclave",
+                               cl::desc("Enable instrumentation for enclave"),
+                               cl::Hidden, cl::init(false));
+
 STATISTIC(NumInstrumentedReads, "Number of instrumented reads");
 STATISTIC(NumInstrumentedWrites, "Number of instrumented writes");
 STATISTIC(NumOptimizedAccessesToGlobalVar,
@@ -439,6 +445,49 @@ struct ShadowMapping {
   bool OrShadowOffset;
   bool InGlobal;
 };
+
+SmallVector<User *> getNonCastUsers(Value *value) {
+  SmallVector<User *> users;
+  for (User *user : value->users()) {
+    if (CastInst *CastI = dyn_cast<CastInst>(user)) {
+      users.append(getNonCastUsers(CastI));
+    } else {
+      users.push_back(user);
+    }
+  }
+  return users;
+}
+
+bool hasCmpUser(Value *val) {
+  for (auto user : getNonCastUsers(val)) {
+    auto I = dyn_cast<Instruction>(user);
+    if (I && (I->getOpcode() == Instruction::ICmp ||
+              I->getOpcode() == Instruction::FCmp)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static inline Value *stripCast(Value *val) {
+  while (CastInst *castI = dyn_cast<CastInst>(val)) {
+    val = castI->getOperand(0);
+  }
+  return val;
+}
+
+static inline bool usedAsFunction(Value *val) {
+  if (val->getType()->isFunctionTy())
+    return true;
+  for (auto user : getNonCastUsers(val)) {
+    if (CallInst *CI = dyn_cast<CallInst>(user)) {
+      if (stripCast(CI->getCalledOperand()) == val) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 } // end anonymous namespace
 
@@ -1441,6 +1490,8 @@ void AddressSanitizer::getInterestingMemoryOperands(
   if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
     if (!ClInstrumentReads || ignoreAccess(LI->getPointerOperand()))
       return;
+    if ((LI->getName() == "vtable") or usedAsFunction(LI))
+      return;
     Interesting.emplace_back(I, LI->getPointerOperandIndex(), false,
                              LI->getType(), LI->getAlign());
   } else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
@@ -1743,8 +1794,13 @@ void AddressSanitizer::instrumentAddress(Instruction *OrigIns,
 
   if (UseCalls) {
     if (Exp == 0)
+      if (ClEnclave) {
+        IRB.CreateCall(AsanMemoryAccessCallback[IsWrite][0][AccessSizeIndex],
+                       {AddrLong, IRB.getInt1(hasCmpUser(OrigIns))});
+      } else {
       IRB.CreateCall(AsanMemoryAccessCallback[IsWrite][0][AccessSizeIndex],
                      AddrLong);
+      }
     else
       IRB.CreateCall(AsanMemoryAccessCallback[IsWrite][1][AccessSizeIndex],
                      {AddrLong, ConstantInt::get(IRB.getInt32Ty(), Exp)});
@@ -1802,8 +1858,13 @@ void AddressSanitizer::instrumentUnusualSizeOrAlignment(
   Value *AddrLong = IRB.CreatePointerCast(Addr, IntptrTy);
   if (UseCalls) {
     if (Exp == 0)
+      if (ClEnclave) {
+        IRB.CreateCall(AsanMemoryAccessCallbackSized[IsWrite][0],
+                       {AddrLong, Size, IRB.getInt1(hasCmpUser(I))});
+      } else {
       IRB.CreateCall(AsanMemoryAccessCallbackSized[IsWrite][0],
                      {AddrLong, Size});
+      }
     else
       IRB.CreateCall(AsanMemoryAccessCallbackSized[IsWrite][1],
                      {AddrLong, Size, ConstantInt::get(IRB.getInt32Ty(), Exp)});
@@ -2641,9 +2702,18 @@ void AddressSanitizer::initializeCallbacks(Module &M) {
           kAsanReportErrorTemplate + ExpStr + TypeStr + "_n" + EndingStr,
           FunctionType::get(IRB.getVoidTy(), Args2, false));
 
+
+      if (ClEnclave && !Exp) {
+        AsanMemoryAccessCallbackSized[AccessIsWrite][0] = M.getOrInsertFunction(
+            ClMemoryAccessCallbackPrefix + ExpStr + TypeStr + "N" + EndingStr,
+            FunctionType::get(IRB.getVoidTy(),
+                              {IntptrTy, IntptrTy, Type::getInt1Ty(*C)},
+                              false));
+      } else {
       AsanMemoryAccessCallbackSized[AccessIsWrite][Exp] = M.getOrInsertFunction(
           ClMemoryAccessCallbackPrefix + ExpStr + TypeStr + "N" + EndingStr,
           FunctionType::get(IRB.getVoidTy(), Args2, false));
+      }
 
       for (size_t AccessSizeIndex = 0; AccessSizeIndex < kNumberOfAccessSizes;
            AccessSizeIndex++) {
@@ -2653,10 +2723,18 @@ void AddressSanitizer::initializeCallbacks(Module &M) {
                 kAsanReportErrorTemplate + ExpStr + Suffix + EndingStr,
                 FunctionType::get(IRB.getVoidTy(), Args1, false));
 
+        if (ClEnclave && !Exp) {
+          AsanMemoryAccessCallback[AccessIsWrite][0][AccessSizeIndex] =
+              M.getOrInsertFunction(
+                  ClMemoryAccessCallbackPrefix + ExpStr + Suffix + EndingStr,
+                  FunctionType::get(IRB.getVoidTy(),
+                                    {IntptrTy, Type::getInt1Ty(*C)}, false));
+        }else {
         AsanMemoryAccessCallback[AccessIsWrite][Exp][AccessSizeIndex] =
             M.getOrInsertFunction(
                 ClMemoryAccessCallbackPrefix + ExpStr + Suffix + EndingStr,
                 FunctionType::get(IRB.getVoidTy(), Args1, false));
+        }
       }
     }
   }
@@ -2777,6 +2855,9 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   if (F.getLinkage() == GlobalValue::AvailableExternallyLinkage) return false;
   if (!ClDebugFunc.empty() && ClDebugFunc == F.getName()) return false;
   if (F.getName().startswith("__asan_")) return false;
+  if (ClEnclave && (F.getName().startswith("sgx_sgxsan_ecall") ||
+                    F.getName().startswith("sgxsan_ocall")))
+    return false;
 
   bool FunctionModified = false;
 
@@ -2866,6 +2947,8 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   bool UseCalls = (ClInstrumentationWithCallsThreshold >= 0 &&
                    OperandsToInstrument.size() + IntrinToInstrument.size() >
                        (unsigned)ClInstrumentationWithCallsThreshold);
+  if (ClEnclave)
+    UseCalls = true;
   const DataLayout &DL = F.getParent()->getDataLayout();
   ObjectSizeOpts ObjSizeOpts;
   ObjSizeOpts.RoundToAlign = true;
@@ -2888,19 +2971,21 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   FunctionStackPoisoner FSP(F, *this);
   bool ChangedStack = FSP.runOnFunction();
 
+#if (0)
   // We must unpoison the stack before NoReturn calls (throw, _exit, etc).
   // See e.g. https://github.com/google/sanitizers/issues/37
   for (auto CI : NoReturnCalls) {
     IRBuilder<> IRB(CI);
     IRB.CreateCall(AsanHandleNoReturnFunc, {});
   }
+#endif
 
   for (auto Inst : PointerComparisonsOrSubtracts) {
     instrumentPointerComparisonOrSubtraction(Inst);
     FunctionModified = true;
   }
 
-  if (ChangedStack || !NoReturnCalls.empty())
+  if (ChangedStack /* || !NoReturnCalls.empty() */)
     FunctionModified = true;
 
   LLVM_DEBUG(dbgs() << "ASAN done instrumenting: " << FunctionModified << " "
@@ -3406,7 +3491,11 @@ void FunctionStackPoisoner::processStaticAllocas() {
       IntptrPtrTy);
   IRB.CreateStore(IRB.CreatePointerCast(&F, IntptrTy), BasePlus2);
 
-  const auto &ShadowAfterScope = GetShadowBytesAfterScope(SVD, L);
+  auto ShadowAfterScope = GetShadowBytesAfterScope(SVD, L);
+  for (auto &byte : ShadowAfterScope) {
+    byte &= kSGXSanL1Filter;
+    byte |= kSGXSanInEnclaveMagic;
+  }
 
   // Poison the stack red zones at the entry.
   Value *ShadowBase = ASan.memToShadow(LocalStackBase, IRB);
@@ -3415,7 +3504,11 @@ void FunctionStackPoisoner::processStaticAllocas() {
   copyToShadow(ShadowAfterScope, ShadowAfterScope, IRB, ShadowBase);
 
   if (!StaticAllocaPoisonCallVec.empty()) {
-    const auto &ShadowInScope = GetShadowBytes(SVD, L);
+    auto ShadowInScope = GetShadowBytes(SVD, L);
+    for (auto &byte : ShadowInScope) {
+      byte &= kSGXSanL1Filter;
+      byte |= kSGXSanInEnclaveMagic;
+    }
 
     // Poison static allocas near lifetime intrinsics.
     for (const auto &APC : StaticAllocaPoisonCallVec) {
