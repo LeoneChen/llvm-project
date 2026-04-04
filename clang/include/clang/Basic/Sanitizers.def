@@ -40,6 +40,9 @@
 // AddressSanitizer
 SANITIZER("address", Address)
 
+// SGXLogicSanitizer
+SANITIZER("sgx-logic", SGXLogic)
+
 // Requires AddressSanitizer
 SANITIZER("pointer-compare", PointerCompare)
 

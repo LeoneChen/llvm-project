@@ -1444,6 +1444,13 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
   if (SanArgs.needsAsanRt())
     HelperStaticRuntimes.push_back("asan_static");
 
+  // For DSOs, link the SLSAN weak-stub static library so that
+  // --no-undefined is satisfied at link time.  At runtime the strong
+  // definitions in the main binary (which links the full slsan runtime)
+  // override these weak stubs via normal ELF symbol interposition.
+  if (SanArgs.needsSlsanRt())
+    HelperStaticRuntimes.push_back("slsan_static");
+
   // Collect static runtimes.
   if (Args.hasArg(options::OPT_shared)) {
     // Don't link static runtimes into DSOs.
@@ -1458,6 +1465,8 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
     if (SanArgs.linkCXXRuntimes())
       StaticRuntimes.push_back("asan_cxx");
   }
+  if (!SanArgs.needsSharedRt() && SanArgs.needsSlsanRt())
+    StaticRuntimes.push_back("slsan");
 
   if (!SanArgs.needsSharedRt() && SanArgs.needsMemProfRt()) {
     StaticRuntimes.push_back("memprof");
